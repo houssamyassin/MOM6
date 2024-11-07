@@ -59,6 +59,7 @@ type, public :: hor_visc_CS ; private
                              !! the viscosity bounds to the theoretical maximum
                              !! for stability without considering other terms [nondim].
                              !! The default is 0.8.
+  real    :: EBT_power       !< Power to raise EBT vertical structure to. Default 1.0.
   logical :: Smagorinsky_Kh  !< If true, use Smagorinsky nonlinear eddy
                              !! viscosity. KH is the background value.
   logical :: Smagorinsky_Ah  !< If true, use a biharmonic form of Smagorinsky
@@ -77,6 +78,11 @@ type, public :: hor_visc_CS ; private
                              !! that gets backscattered in the Leith+E scheme. [nondim]
   logical :: smooth_Ah       !< If true (default), then Ah and m_leithy are smoothed.
                              !! This smoothing requires a lot of blocking communication.
+  integer :: num_smooth_Ah   !! Number of times Ah and m_leithy are smoothed (divided by 2)
+  logical :: res_scale_leithy  !< If true, the Laplacian and Biharmonic viscosity contributions 
+                             !! from leithy are scaled by one minus the resolution function.
+  logical :: res_scale_Ro_leithy    !! If true, the Laplacian and Biharmonic viscosity contributions
+                             !! from leithy are scaled by 1/(1-c*Ro^n).
   logical :: use_QG_Leith_visc    !< If true, use QG Leith nonlinear eddy viscosity.
                              !! KH is the background value.
   logical :: bound_Coriolis  !< If true & SMAGORINSKY_AH is used, the biharmonic
@@ -100,6 +106,8 @@ type, public :: hor_visc_CS ; private
                              !! of state. This is set depending on ANISOTROPIC_MODE.
   logical :: res_scale_MEKE  !< If true, the viscosity contribution from MEKE is scaled by
                              !! the resolution function.
+  logical :: res_scale_MEKE_rev  !< If true, the viscosity contribution from MEKE is scaled by
+                             !! one minus the resolution function.
   logical :: use_GME         !< If true, use GME backscatter scheme.
   integer :: answer_date     !< The vintage of the order of arithmetic and expressions in the
                              !! horizontal viscosity calculations.  Values below 20190101 recover
@@ -213,6 +221,7 @@ type, public :: hor_visc_CS ; private
   integer :: id_intz_diffu_2d = -1, id_intz_diffv_2d = -1
   integer :: id_diffu_visc_rem = -1, id_diffv_visc_rem = -1
   integer :: id_Ah_h      = -1, id_Ah_q          = -1
+  integer :: id_RoScl     = -1
   integer :: id_Kh_h      = -1, id_Kh_q          = -1
   integer :: id_GME_coeff_h = -1, id_GME_coeff_q = -1
   integer :: id_dudx_bt = -1, id_dvdy_bt = -1
@@ -348,6 +357,7 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
     div_xx_h,      & ! horizontal divergence [T-1 ~> s-1]
     sh_xx_h,       & ! horizontal tension (du/dx - dv/dy) including metric terms [T-1 ~> s-1]
     NoSt             ! A diagnostic array of normal stress [T-1 ~> s-1].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: RoScl_array      ! An array of RoScl, the scaling function for MEKE source term
   real, dimension(SZI_(G),SZJ_(G),SZK_(G)) :: &
     grid_Re_Kh, &    ! Grid Reynolds number for Laplacian horizontal viscosity at h points [nondim]
     grid_Re_Ah, &    ! Grid Reynolds number for Biharmonic horizontal viscosity at h points [nondim]
@@ -454,13 +464,19 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
   rescale_Kh = .false.
   if (VarMix%use_variable_mixing) then
     rescale_Kh = VarMix%Resoln_scaled_Kh
-    if ((rescale_Kh .or. CS%res_scale_MEKE) &
+    if ((rescale_Kh .or. CS%res_scale_MEKE .or. CS%res_scale_MEKE_rev) &
         .and. (.not. allocated(VarMix%Res_fn_h) .or. .not. allocated(VarMix%Res_fn_q))) &
       call MOM_error(FATAL, "MOM_hor_visc: VarMix%Res_fn_h and VarMix%Res_fn_q "//&
-                     "both need to be associated with Resoln_scaled_Kh or RES_SCALE_MEKE_VISC.")
-  elseif (CS%res_scale_MEKE) then
+                     "both need to be associated with Resoln_scaled_Kh or RES_SCALE_MEKE_VISC " //&
+                     "or RES_SCALE_MEKE_VISC_REV.")
+  elseif (CS%res_scale_MEKE .or. CS%res_scale_MEKE_rev) then
     call MOM_error(FATAL, "MOM_hor_visc: VarMix needs to be associated if "//&
-                          "RES_SCALE_MEKE_VISC is True.")
+                          "RES_SCALE_MEKE_VISC or RES_SCALE_MEKE_VISC_REV is True.")
+  endif
+
+  if (CS%res_scale_MEKE .and. CS%res_scale_MEKE_rev) then
+    call MOM_error(FATAL, "MOM_hor_visc: RES_SCALE_MEKE_VISC and RES_SCALE_MEKE_VISC_REVs "//&
+    "cannot both be True.")
   endif
 
   ! Set the halo sizes used for the thickness-point viscosities.
@@ -1101,11 +1117,15 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
         ! *Add* the MEKE contribution (which might be negative)
         if (CS%res_scale_MEKE) then
           do j=js_Kh,je_Kh ; do i=is_Kh,ie_Kh
-            Kh(i,j) = Kh(i,j) + MEKE%Ku(i,j) * VarMix%Res_fn_h(i,j)
+            Kh(i,j) = Kh(i,j) + MEKE%Ku(i,j) * VarMix%ebt_struct(i,j,k)**(CS%EBT_power) * VarMix%Res_fn_h(i,j)
+          enddo ; enddo
+        elseif (CS%res_scale_MEKE_rev) then
+          do j=js_Kh,je_Kh ; do i=is_Kh,ie_Kh
+            Kh(i,j) = Kh(i,j) + MEKE%Ku(i,j) * VarMix%ebt_struct(i,j,k)**(CS%EBT_power) * (1-VarMix%Res_fn_h(i,j))
           enddo ; enddo
         else
           do j=js_Kh,je_Kh ; do i=is_Kh,ie_Kh
-            Kh(i,j) = Kh(i,j) + MEKE%Ku(i,j)
+            Kh(i,j) = Kh(i,j) + MEKE%Ku(i,j) * VarMix%ebt_struct(i,j,k)**(CS%EBT_power)
           enddo ; enddo
         endif
       endif
@@ -1235,9 +1255,36 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
 
           if (CS%smooth_Ah) then
             ! Smooth m_leithy.  A single call smoothes twice.
-            call pass_var(m_leithy, G%Domain, halo=2)
-            call smooth_x9_h(G, m_leithy, zero_land=.true.)
+            do j=1, CS%num_smooth_Ah
+              call pass_var(m_leithy, G%Domain, halo=2)
+              call smooth_x9_h(G, m_leithy, zero_land=.true.)
+            end do
             call pass_var(m_leithy, G%Domain)
+          endif
+          if (CS%res_scale_leithy) then
+            ! Scale m_leithy by one minus the resolution function.
+            do j=js_Kh,je_Kh ; do i=is_Kh,ie_Kh
+              m_leithy(i,j) = m_leithy(i,j)* (1. - VarMix%Res_fn_h(i,j))
+            enddo ; enddo
+          endif
+          if (CS%res_scale_Ro_leithy .and. MEKE%backscatter_Ro_c /= 0.) then
+            do j=js_Kh,je_Kh ; do i=is_Kh,ie_Kh
+              FatH = 0.25*( (abs(G%CoriolisBu(I-1,J-1)) + abs(G%CoriolisBu(I,J))) + &
+                            (abs(G%CoriolisBu(I-1,J)) + abs(G%CoriolisBu(I,J-1))) )
+              Shear_mag_bc = sqrt(sh_xx(i,j) * sh_xx(i,j) + &
+                0.25*((sh_xy(I-1,J-1)*sh_xy(I-1,J-1) + sh_xy(I,J)*sh_xy(I,J)) + &
+                      (sh_xy(I-1,J)*sh_xy(I-1,J) + sh_xy(I,J-1)*sh_xy(I,J-1))))
+              FatH = (US%s_to_T*FatH)**MEKE%backscatter_Ro_pow ! f^n
+              ! Note the hard-coded dimensional constant in the following line that can not
+              ! be rescaled for dimensional consistency.
+              Shear_mag_bc = (((US%s_to_T * Shear_mag_bc)**MEKE%backscatter_Ro_pow) + 1.e-30) &
+                            * MEKE%backscatter_Ro_c ! c * D^n
+              ! The Rossby number function is g(Ro) = 1/(1+c.Ro^n)
+              ! RoScl = 1 - g(Ro)
+              RoScl = Shear_mag_bc / (FatH + Shear_mag_bc) ! = 1 - f^n/(f^n+c*D^n)
+              m_leithy(i,j) = m_leithy(i,j)* (1. - RoScl)
+              RoScl_array(i,j,k) = RoScl
+            enddo ; enddo
           endif
           ! Get Ah
           do j=js_Kh,je_Kh ; do i=is_Kh,ie_Kh
@@ -1488,8 +1535,11 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
         if (rescale_Kh) &
           Kh(I,J) = VarMix%Res_fn_q(I,J) * Kh(I,J)
 
-        if (CS%res_scale_MEKE) &
+        if (CS%res_scale_MEKE) then
           meke_res_fn = VarMix%Res_fn_q(I,J)
+        elseif (CS%res_scale_MEKE_rev) then
+          meke_res_fn = 1-VarMix%Res_fn_q(I,J)
+        endif
 
         ! Older method of bounding for stability
         if (legacy_bound) &
@@ -1499,8 +1549,10 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
 
         if (use_MEKE_Ku) then
           ! *Add* the MEKE contribution (might be negative)
-          Kh(I,J) = Kh(I,J) + 0.25*( (MEKE%Ku(i,j) + MEKE%Ku(i+1,j+1)) + &
-                           (MEKE%Ku(i+1,j) + MEKE%Ku(i,j+1)) ) * meke_res_fn
+          Kh(I,J) = Kh(I,J) + 0.25*( (MEKE%Ku(i,j) * VarMix%ebt_struct(i,j,k)**(CS%EBT_power)  & 
+                                    + MEKE%Ku(i+1,j+1) * VarMix%ebt_struct(i+1,j+1,k)**(CS%EBT_power) ) &
+                                    + (MEKE%Ku(i+1,j) * VarMix%ebt_struct(i+1,j,k)**(CS%EBT_power) &
+                                    + MEKE%Ku(i,j+1) * VarMix%ebt_struct(i,j+1,k)**(CS%EBT_power)) ) * meke_res_fn
         endif
 
         if (CS%anisotropic) &
@@ -1824,6 +1876,8 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
               RoScl = Sh_F_pow / (1.0 + Sh_F_pow) ! = 1 - f^n/(f^n+c*D^n)
             endif
           endif
+          
+          !RoScl_array(i,j,k) = RoScl
 
           MEKE%mom_src(i,j) = MEKE%mom_src(i,j) + GV%H_to_RZ * ( &
                 ((str_xx(i,j)-RoScl*bhstr_xx(i,j))*(u(I,j,k)-u(I-1,j,k))*G%IdxT(i,j)  &
@@ -1864,6 +1918,7 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
   if (CS%id_diffv>0)     call post_data(CS%id_diffv, diffv, CS%diag)
   if (CS%id_FrictWork>0) call post_data(CS%id_FrictWork, FrictWork, CS%diag)
   if (CS%id_Ah_h>0)      call post_data(CS%id_Ah_h, Ah_h, CS%diag)
+  if (CS%id_RoScl>0)      call post_data(CS%id_RoScl, RoScl_array, CS%diag)
   if (CS%id_grid_Re_Ah>0) call post_data(CS%id_grid_Re_Ah, grid_Re_Ah, CS%diag)
   if (CS%id_div_xx_h>0)  call post_data(CS%id_div_xx_h, div_xx_h, CS%diag)
   if (CS%id_vort_xy_q>0) call post_data(CS%id_vort_xy_q, vort_xy_q, CS%diag)
@@ -2078,7 +2133,10 @@ subroutine hor_visc_init(Time, G, GV, US, param_file, diag, CS, ADp)
                  "the resolution function.", default=.false., &
                  do_not_log=.not.(CS%Laplacian.and.use_MEKE))
   if (.not.(CS%Laplacian.and.use_MEKE)) CS%res_scale_MEKE = .false.
-
+  call get_param(param_file, mdl, "RES_SCALE_MEKE_VISC_REV", CS%res_scale_MEKE_rev, &
+                 "If true, the viscosity contribution from MEKE is scaled by "//&
+                 "one minus the resolution function.", default=.false., &
+                 do_not_log=.not.(CS%Laplacian.and.use_MEKE))
   call get_param(param_file, mdl, "BOUND_KH", CS%bound_Kh, &
                  "If true, the Laplacian coefficient is locally limited "//&
                  "to be stable.", default=.true., do_not_log=.not.CS%Laplacian)
@@ -2228,6 +2286,9 @@ subroutine hor_visc_init(Time, G, GV, US, param_file, diag, CS, ADp)
                  "viscosity bounds to the theoretical maximum for "//&
                  "stability without considering other terms.", units="nondim", &
                  default=0.8, do_not_log=.not.(CS%better_bound_Ah .or. CS%better_bound_Kh))
+  call get_param(param_file, mdl, "EBT_POWER", CS%EBT_power, &
+                 "Power to raise EBT vertical structure to", units="nondim", &
+                 default=1.0)
   call get_param(param_file, mdl, "NOSLIP", CS%no_slip, &
                  "If true, no slip boundary conditions are used; otherwise "//&
                  "free slip boundary conditions are assumed. The "//&
@@ -2263,7 +2324,18 @@ subroutine hor_visc_init(Time, G, GV, US, param_file, diag, CS, ADp)
                  "If true, Ah and m_leithy are smoothed within Leith+E.  This requires "//&
                  "lots of blocking communications, which can be expensive", &
                  default=.true., do_not_log=.not.CS%use_Leithy)
-
+  call get_param(param_file, mdl, "NUM_SMOOTH_AH", CS%num_smooth_Ah, &
+                 "The number of times Ah and m_leithy are smoothed, divided by two. "//&
+                 "That is, NUM_SMOOTH_AH=1 smoothes twice. ", &
+                 default=1, do_not_log=.not.CS%use_Leithy)
+  call get_param(param_file, mdl, "RES_SCALE_LEITHY", CS%res_scale_leithy, &
+                 "If true, both the Laplacian and Biharmonic viscosity contributions"//&
+                 "from leithy are scaled by one minus the resolution function.", default=.false., &
+                 do_not_log=.not.CS%use_Leithy)
+  call get_param(param_file, mdl, "RES_SCALE_RO_LEITHY", CS%res_scale_Ro_leithy, &
+                 "If true, both the Laplacian and Biharmonic viscosity contributions"//&
+                 "from leithy are scaled by 1/(1+c*Ro^n).", default=.false., &
+                 do_not_log=.not.CS%use_Leithy)
   if (CS%use_GME .and. .not.split) call MOM_error(FATAL,"ERROR: Currently, USE_GME = True "// &
                                            "cannot be used with SPLIT=False.")
 
@@ -2735,6 +2807,9 @@ subroutine hor_visc_init(Time, G, GV, US, param_file, diag, CS, ADp)
   if ((CS%id_diffv_visc_rem > 0) .and. (present(ADp))) then
     call safe_alloc_ptr(ADp%visc_rem_v,G%isd,G%ied,G%JsdB,G%JedB,GV%ke)
   endif
+
+  CS%id_RoScl = register_diag_field('ocean_model', 'RoScl', diag%axesTL, Time,    &
+      'Scaling function for the Rossby number', 'nondim')
 
   if (CS%biharmonic) then
     CS%id_Ah_h = register_diag_field('ocean_model', 'Ahh', diag%axesTL, Time,    &
