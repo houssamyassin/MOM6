@@ -81,6 +81,7 @@ type, public :: hor_visc_CS ; private
   integer :: num_smooth_Ah   !! Number of times Ah and m_leithy are smoothed (divided by 2)
   logical :: res_scale_leithy  !< If true, the Laplacian and Biharmonic viscosity contributions 
                              !! from leithy are scaled by one minus the resolution function.
+  real    :: res_scale_Ro_thres !! The Rossby number threshold above which backscatter is turned off                           
   logical :: res_scale_Ro_leithy    !! If true, the Laplacian and Biharmonic viscosity contributions
                              !! from leithy are scaled by 1/(1-c*Ro^n).
   logical :: use_QG_Leith_visc    !< If true, use QG Leith nonlinear eddy viscosity.
@@ -1267,22 +1268,19 @@ subroutine horizontal_viscosity(u, v, h, diffu, diffv, MEKE, VarMix, G, GV, US, 
               m_leithy(i,j) = m_leithy(i,j)* (1. - VarMix%Res_fn_h(i,j))
             enddo ; enddo
           endif
-          if (CS%res_scale_Ro_leithy .and. MEKE%backscatter_Ro_c /= 0.) then
+          if (CS%res_scale_Ro_leithy) then
             do j=js_Kh,je_Kh ; do i=is_Kh,ie_Kh
               FatH = 0.25*( (abs(G%CoriolisBu(I-1,J-1)) + abs(G%CoriolisBu(I,J))) + &
                             (abs(G%CoriolisBu(I-1,J)) + abs(G%CoriolisBu(I,J-1))) )
               Shear_mag_bc = sqrt(sh_xx(i,j) * sh_xx(i,j) + &
                 0.25*((sh_xy(I-1,J-1)*sh_xy(I-1,J-1) + sh_xy(I,J)*sh_xy(I,J)) + &
                       (sh_xy(I-1,J)*sh_xy(I-1,J) + sh_xy(I,J-1)*sh_xy(I,J-1))))
-              FatH = (US%s_to_T*FatH)**MEKE%backscatter_Ro_pow ! f^n
-              ! Note the hard-coded dimensional constant in the following line that can not
-              ! be rescaled for dimensional consistency.
-              Shear_mag_bc = (((US%s_to_T * Shear_mag_bc)**MEKE%backscatter_Ro_pow) + 1.e-30) &
-                            * MEKE%backscatter_Ro_c ! c * D^n
-              ! The Rossby number function is g(Ro) = 1/(1+c.Ro^n)
-              ! RoScl = 1 - g(Ro)
-              RoScl = Shear_mag_bc / (FatH + Shear_mag_bc) ! = 1 - f^n/(f^n+c*D^n)
-              m_leithy(i,j) = m_leithy(i,j)* (1. - RoScl)
+              if (Shear_mag_bc <= CS%res_scale_Ro_thres * FatH) then
+                RoScl = 1.0
+              else
+                RoScl = 0  
+              endif      
+              m_leithy(i,j) = m_leithy(i,j) * RoScl
               RoScl_array(i,j,k) = RoScl
             enddo ; enddo
           endif
@@ -2336,6 +2334,9 @@ subroutine hor_visc_init(Time, G, GV, US, param_file, diag, CS, ADp)
                  "If true, both the Laplacian and Biharmonic viscosity contributions"//&
                  "from leithy are scaled by 1/(1+c*Ro^n).", default=.false., &
                  do_not_log=.not.CS%use_Leithy)
+  call get_param(param_file, mdl, "RES_SCALE_RO_THRESHOLD", CS%res_scale_Ro_thres, &
+                 "The Rossby number threshold above which backscatter is set to 0.", &
+                  units="nondim", default=0.25, do_not_log=.not.CS%use_Leithy)  
   if (CS%use_GME .and. .not.split) call MOM_error(FATAL,"ERROR: Currently, USE_GME = True "// &
                                            "cannot be used with SPLIT=False.")
 
